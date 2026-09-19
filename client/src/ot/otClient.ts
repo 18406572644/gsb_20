@@ -13,7 +13,7 @@
 import { compose, isNoop, transformPair, type Op } from '../../../shared/ot'
 
 export interface OTCallbacks {
-  sendOp: (op: Op, opId: string, revision: number) => void
+  sendOp: (op: Op, opId: string, revision: number, epoch: number) => void
   /** 将一个已完成变换的远程操作应用到本地文档 */
   applyRemote: (op: Op) => void
   requestResync: () => void
@@ -27,6 +27,16 @@ interface Unacked {
 
 export class OTClient {
   revision = 0
+  /**
+   * 版本纪元：来自最近一次 welcome，随每次提交回传服务端。
+   * 文档被恢复到历史版本后服务端纪元 +1，旧纪元的提交会被拒绝。
+   */
+  epoch = 0
+  /**
+   * 冻结态：收到 restore:begin 后置 true，暂停一切本地提交与发送，
+   * 直到恢复触发的全量快照 welcome 到达并解冻。避免基于过期版本继续产生操作。
+   */
+  private frozen = false
   private unacked: Unacked[] = []
   private connected = false
   private lastSendAt = 0
@@ -60,8 +70,9 @@ export class OTClient {
     if (v) this.trySend()
   }
 
-  /** 本地编辑：乐观应用（调用方负责），此处仅入队并尝试发送 */
+  /** 本地编辑：乐观应用（调用方负责），此处仅入队并尝试发送。冻结态下忽略（恢复重同步中） */
   localChange(op: Op) {
+    if (this.frozen) return
     if (isNoop(op)) return
     const last = this.unacked[this.unacked.length - 1]
     if (last && !last.sent) {
@@ -72,8 +83,30 @@ export class OTClient {
     this.trySend()
   }
 
+  /** 恢复开始：冻结提交并丢弃所有未确认操作（它们基于过期版本，全量快照随后到达） */
+  freeze() {
+    this.frozen = true
+    this.unacked = []
+    this.clearAckTimer()
+    if (this.sendTimer) {
+      clearTimeout(this.sendTimer)
+      this.sendTimer = null
+    }
+  }
+
+  /** 全量快照到达后解冻（revision/epoch 由 rollback/快照流程另行设置） */
+  unfreeze() {
+    this.frozen = false
+    this.trySend()
+  }
+
+  get isFrozen() {
+    return this.frozen
+  }
+
   /** 远程操作：与全部未确认操作互变换后返回应应用到本地文档的操作 */
   remoteChange(op: Op) {
+    if (this.frozen) return
     let x = op
     for (const u of this.unacked) {
       const pair = transformPair(x, u.op)
@@ -85,6 +118,7 @@ export class OTClient {
   }
 
   ack(opId: string, revision: number) {
+    if (this.frozen) return
     if (!this.unacked.length || this.unacked[0].opId !== opId) {
       // ack 与本地队列对不上（可能丢消息）→ 重同步
       this.cb.requestResync()
@@ -101,6 +135,7 @@ export class OTClient {
    * 其中可能包含「服务器已收到但 ack 丢失」的自己的操作 —— 按 opId 匹配直接确认。
    */
   resyncOps(missed: { opId: string; op: Op }[], revision: number) {
+    if (this.frozen) return
     for (const m of missed) {
       const idx = this.unacked.findIndex((u) => u.opId === m.opId)
       if (idx >= 0) {
@@ -116,11 +151,13 @@ export class OTClient {
     this.trySend()
   }
 
-  /** 全量快照回滚：丢弃所有未确认操作。返回是否有被丢弃的本地修改。 */
-  rollback(revision: number): boolean {
+  /** 全量快照回滚：丢弃所有未确认操作、更新版本与纪元并解冻。返回是否有被丢弃的本地修改。 */
+  rollback(revision: number, epoch?: number): boolean {
     const hadUnsynced = this.unacked.length > 0
     this.unacked = []
     this.revision = revision
+    if (typeof epoch === 'number') this.epoch = epoch
+    this.frozen = false
     this.clearAckTimer()
     if (this.sendTimer) {
       clearTimeout(this.sendTimer)
@@ -130,7 +167,7 @@ export class OTClient {
   }
 
   private trySend() {
-    if (!this.connected) return
+    if (!this.connected || this.frozen) return
     const head = this.unacked[0]
     if (!head || head.sent) return
     const wait = this.lastSendAt + this.minSendInterval - Date.now()
@@ -146,7 +183,7 @@ export class OTClient {
     head.sent = true
     this.lastSendAt = Date.now()
     this.armAckTimer()
-    this.cb.sendOp(head.op, head.opId, this.revision)
+    this.cb.sendOp(head.op, head.opId, this.revision, this.epoch)
   }
 
   private armAckTimer() {

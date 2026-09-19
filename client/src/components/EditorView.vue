@@ -174,7 +174,7 @@ function reportSelection() {
 
 function updateAnnFab() {
   if (annPopVisible.value) return
-  if (doc.selection && session.canAnnotate) {
+  if (doc.selection && session.canAnnotate && !session.restoring) {
     const p = measurePos(doc.selection.end)
     const ta = taRef.value!
     const wrap = wrapRef.value!
@@ -261,8 +261,14 @@ watch(
       ref="taRef"
       class="editor-textarea"
       :value="doc.text"
-      :readonly="!session.canEdit"
-      :placeholder="session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
+      :readonly="session.editorReadonly"
+      :placeholder="
+        session.restoring
+          ? '文档正在恢复到历史版本，已暂停编辑，等待全量同步…'
+          : session.canEdit
+            ? '开始输入，内容将实时同步给协作者…'
+            : '当前身份为只读/批注，无法编辑正文'
+      "
       spellcheck="false"
       @input="onInput"
       @scroll="syncScroll"

@@ -15,6 +15,7 @@ const form = reactive({
 const joining = ref(false)
 
 const ROLE_DESCS: Record<Role, string> = {
+  admin: '拥有编辑/批注全部权限，并可查看版本时间线、预览历史版本与发起恢复',
   editor: '可编辑正文，也可添加与回复批注',
   commenter: '不可修改正文，可选中文字添加批注',
   viewer: '仅可查看文档、批注与他人光标',
@@ -42,6 +43,7 @@ function join() {
         </el-form-item>
         <el-form-item label="身份">
           <el-radio-group v-model="form.role">
+            <el-radio-button value="admin">管理</el-radio-button>
             <el-radio-button value="editor">编辑</el-radio-button>
             <el-radio-button value="commenter">批注</el-radio-button>
             <el-radio-button value="viewer">只读</el-radio-button>

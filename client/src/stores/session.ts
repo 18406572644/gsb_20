@@ -1,6 +1,6 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { Role, UserInfo } from '../../../shared/protocol'
+import { canManageHistory, type Role, type UserInfo } from '../../../shared/protocol'
 import type { ConnStatus } from '@/ws/wsClient'
 
 /** 会话状态：连接、身份、在线用户、远程光标 */
@@ -16,10 +16,22 @@ export const useSessionStore = defineStore('session', () => {
   const reconnectAttempt = ref(0)
   /** 用户手动模拟断网 */
   const simulatedOffline = ref(false)
+  /**
+   * 文档正被管理员恢复到历史版本：收到 restore:begin 到全量快照到达之间为 true。
+   * 期间编辑器只读、暂停一切本地提交。
+   */
+  const restoring = ref(false)
+  /** 最近一次恢复的提示信息（全量快照到达后用于提示） */
+  const restoredNotice = ref('')
 
-  const canEdit = computed(() => role.value === 'editor')
-  const canAnnotate = computed(() => role.value === 'editor' || role.value === 'commenter')
+  const canEdit = computed(() => role.value === 'editor' || role.value === 'admin')
+  const canAnnotate = computed(
+    () => role.value === 'editor' || role.value === 'commenter' || role.value === 'admin',
+  )
+  const canManage = computed(() => canManageHistory(role.value))
   const online = computed(() => status.value === 'online')
+  /** 恢复冻结期间编辑者也临时只读，避免基于过期版本提交 */
+  const editorReadonly = computed(() => !canEdit.value || restoring.value)
 
   function setUsers(list: UserInfo[]) {
     users.value = list
@@ -38,6 +50,8 @@ export const useSessionStore = defineStore('session', () => {
     status.value = 'offline'
     reconnectAttempt.value = 0
     simulatedOffline.value = false
+    restoring.value = false
+    restoredNotice.value = ''
   }
 
   return {
@@ -51,9 +65,13 @@ export const useSessionStore = defineStore('session', () => {
     status,
     reconnectAttempt,
     simulatedOffline,
+    restoring,
+    restoredNotice,
     canEdit,
     canAnnotate,
+    canManage,
     online,
+    editorReadonly,
     setUsers,
     $reset,
   }

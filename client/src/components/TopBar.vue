@@ -3,12 +3,14 @@ import { computed } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
+import { useHistoryStore } from '@/stores/history'
 import { collab } from '@/collab/collab'
 import { ROLE_LABEL } from '../../../shared/protocol'
 import UserAvatar from '@/components/UserAvatar.vue'
 
 const session = useSessionStore()
 const doc = useDocStore()
+const history = useHistoryStore()
 
 const connTag = computed(() => {
   switch (session.status) {
@@ -35,6 +37,7 @@ const syncTag = computed(() => {
 })
 
 const roleTagType = computed(() => {
+  if (session.role === 'admin') return 'danger'
   if (session.role === 'editor') return 'primary'
   if (session.role === 'commenter') return 'warning'
   return 'info'
@@ -79,6 +82,15 @@ async function quit() {
       </el-tooltip>
     </div>
 
+    <el-button
+      v-if="session.canManage"
+      size="small"
+      type="primary"
+      plain
+      @click="history.open()"
+    >
+      🕘 版本历史
+    </el-button>
     <el-button
       size="small"
       :type="session.status === 'offline' ? 'success' : 'warning'"

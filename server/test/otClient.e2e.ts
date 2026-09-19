@@ -6,7 +6,7 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import WebSocket from 'ws'
 import { apply, diffToOp } from '../../shared/ot'
-import type { ServerMsg } from '../../shared/protocol'
+import type { Role, ServerMsg, VersionMeta } from '../../shared/protocol'
 import { OTClient } from '../../client/src/ot/otClient'
 
 import { mkdtempSync } from 'node:fs'
@@ -33,19 +33,23 @@ class HeadlessClient {
   ws: WebSocket | null = null
   ot: OTClient
   resyncCount = 0
+  restoreBegins = 0
+  restoredSnapshots = 0
+  private reqSeq = 0
 
   constructor(
     readonly name: string,
     readonly docId: string,
+    private role: Role = 'editor',
   ) {
     this.ot = new OTClient({
-      sendOp: (op, opId, revision) => this.send({ type: 'op', op, opId, revision }),
+      sendOp: (op, opId, revision, epoch) => this.send({ type: 'op', op, opId, revision, epoch }),
       applyRemote: (op) => {
         this.doc = apply(this.doc, op)
       },
       requestResync: () => {
         this.resyncCount++
-        this.send({ type: 'resync', lastRevision: this.ot.revision })
+        this.send({ type: 'resync', lastRevision: this.ot.revision, epoch: this.ot.epoch })
       },
     })
     this.ot.minSendInterval = 0
@@ -56,7 +60,19 @@ class HeadlessClient {
     return this.ot.revision
   }
 
-  async join(lastRevision?: number) {
+  get epoch() {
+    return this.ot.epoch
+  }
+
+  get pendingCount() {
+    return this.ot.pendingCount
+  }
+
+  get isReady() {
+    return this.ready
+  }
+
+  async join(lastRevision?: number, epoch?: number) {
     this.ws = new WebSocket(BASE)
     this.ws.on('message', (raw) => this.handle(JSON.parse(raw.toString()) as ServerMsg))
     this.ws.on('error', () => {})
@@ -64,7 +80,15 @@ class HeadlessClient {
       this.ws!.once('open', resolve)
       this.ws!.once('error', reject)
     })
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: 'editor', lastRevision })
+    this.ready = false
+    this.send({
+      type: 'join',
+      docId: this.docId,
+      name: this.name,
+      role: this.role,
+      ...(lastRevision === undefined ? {} : { lastRevision }),
+      ...(epoch === undefined ? {} : { epoch }),
+    })
     await waitFor(() => this.ready, 3000)
   }
 
@@ -74,10 +98,11 @@ class HeadlessClient {
     switch (msg.type) {
       case 'welcome':
         if (msg.snapshot) {
-          this.ot.rollback(msg.revision)
+          this.ot.rollback(msg.revision, msg.epoch)
           this.doc = msg.doc
           this.ot.setConnected(true)
           this.ready = true
+          if (msg.restored) this.restoredSnapshots++
         }
         // 增量路径：等 ops 到达后再置 connected（与 collab.ts 一致）
         break
@@ -92,6 +117,12 @@ class HeadlessClient {
       case 'ack':
         this.ot.ack(msg.opId, msg.revision)
         break
+      case 'restore:begin':
+        // 与 collab.ts 一致：立即冻结，等待随后的全量 welcome
+        this.restoreBegins++
+        this.ot.freeze()
+        this.ready = false
+        break
     }
   }
 
@@ -102,6 +133,48 @@ class HeadlessClient {
     const op = diffToOp(this.doc, newDoc)
     this.doc = newDoc
     this.ot.localChange(op)
+  }
+
+  /** 管理员：拉取时间线并取首个（最新）版本 id */
+  async listVersionIds(): Promise<VersionMeta[]> {
+    const reqId = `hl-${this.reqSeq++}`
+    const reply = new Promise<ServerMsg>((resolve) => {
+      const onMsg = (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as ServerMsg
+        if (
+          (m.type === 'history:list:resp' || m.type === 'history:error') &&
+          (m as { reqId: string }).reqId === reqId
+        ) {
+          this.ws!.off('message', onMsg)
+          resolve(m)
+        }
+      }
+      this.ws!.on('message', onMsg)
+    })
+    this.send({ type: 'history:list', reqId })
+    const m = await reply
+    if (m.type !== 'history:list:resp') throw new Error('list 失败')
+    return m.versions
+  }
+
+  /** 管理员：恢复到指定版本，返回 ack */
+  async restore(versionId: string) {
+    const reqId = `hl-${this.reqSeq++}`
+    const reply = new Promise<ServerMsg>((resolve) => {
+      const onMsg = (raw: Buffer) => {
+        const m = JSON.parse(raw.toString()) as ServerMsg
+        if (
+          (m.type === 'restore:ack' || m.type === 'history:error') &&
+          (m as { reqId: string }).reqId === reqId
+        ) {
+          this.ws!.off('message', onMsg)
+          resolve(m)
+        }
+      }
+      this.ws!.on('message', onMsg)
+    })
+    this.send({ type: 'version:restore', reqId, versionId })
+    return reply
   }
 
   send(obj: object) {
@@ -197,4 +270,50 @@ test('集成: ack 超时触发主动重同步', async () => {
   // ack 永远不来 → ack 超时 → 主动 requestResync
   await waitFor(() => a.resyncCount > 0, 4000)
   a.close()
+})
+
+test('集成: 版本恢复 —— 真实 OTClient 冻结、全量重同步、纪元推进、恢复后继续编辑', async () => {
+  const docId = 'itest-restore'
+  const admin = new HeadlessClient('管理员', docId, 'admin')
+  const editor = new HeadlessClient('编辑者', docId, 'editor')
+  await admin.join()
+  await editor.join()
+
+  // 编辑产生内容，使基线（空）与当前不同
+  editor.type('恢复前的内容0123456789')
+  await waitFor(() => editor.pendingCount === 0 && editor.revision === 1)
+  assert.equal(admin.doc, '恢复前的内容0123456789')
+  assert.equal(editor.epoch, 0)
+  assert.equal(admin.epoch, 0)
+
+  // 管理员取到初始基线版本（revision=0，空文档）并恢复
+  const versions = await admin.listVersionIds()
+  const baseline = versions.find((v) => v.revision === 0)!
+  assert.ok(baseline)
+  const ack = await admin.restore(baseline.id)
+  assert.equal(ack.type, 'restore:ack')
+  if (ack.type !== 'restore:ack') throw new Error('恢复失败')
+  assert.equal(ack.epoch, 1)
+
+  // 双方都收到 restore:begin 并随后收到 restored 全量快照
+  await waitFor(() => admin.restoreBegins > 0 && editor.restoreBegins > 0)
+  await waitFor(() => admin.restoredSnapshots > 0 && editor.restoredSnapshots > 0)
+  await waitFor(() => admin.isReady && editor.isReady)
+  assert.equal(admin.doc, '')
+  assert.equal(editor.doc, '')
+  assert.equal(admin.epoch, 1)
+  assert.equal(editor.epoch, 1)
+  assert.equal(editor.revision, 2) // 恢复合成 1 条操作：1 → 2
+  assert.equal(editor.ot.isFrozen, false, '全量快照到达后应已解冻')
+  assert.equal(editor.pendingCount, 0)
+
+  // 恢复后双方可继续正常协同编辑并收敛
+  editor.type('恢复后的新内容')
+  await waitFor(() => editor.pendingCount === 0)
+  await waitFor(() => admin.doc === editor.doc && admin.revision === editor.revision)
+  assert.equal(editor.doc, '恢复后的新内容')
+  assert.equal(editor.revision, 3)
+
+  admin.close()
+  editor.close()
 })
