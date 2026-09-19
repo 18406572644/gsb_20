@@ -173,7 +173,7 @@ function reportSelection() {
 }
 
 function updateAnnFab() {
-  if (annPopVisible.value) return
+  if (annPopVisible.value || doc.frozen) return
   if (doc.selection && session.canAnnotate) {
     const p = measurePos(doc.selection.end)
     const ta = taRef.value!
@@ -261,8 +261,8 @@ watch(
       ref="taRef"
       class="editor-textarea"
       :value="doc.text"
-      :readonly="!session.canEdit"
-      :placeholder="session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
+      :readonly="!session.canEdit || doc.frozen"
+      :placeholder="doc.frozen ? '版本恢复中，正在全量重新同步…' : session.canEdit ? '开始输入，内容将实时同步给协作者…' : '当前身份为只读/批注，无法编辑正文'"
       spellcheck="false"
       @input="onInput"
       @scroll="syncScroll"

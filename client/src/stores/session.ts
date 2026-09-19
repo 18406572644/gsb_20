@@ -1,6 +1,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import type { Role, UserInfo } from '../../../shared/protocol'
+import { canAnnotate as roleCanAnnotate, canEdit as roleCanEdit, canManage as roleCanManage } from '../../../shared/protocol'
 import type { ConnStatus } from '@/ws/wsClient'
 
 /** 会话状态：连接、身份、在线用户、远程光标 */
@@ -17,8 +18,9 @@ export const useSessionStore = defineStore('session', () => {
   /** 用户手动模拟断网 */
   const simulatedOffline = ref(false)
 
-  const canEdit = computed(() => role.value === 'editor')
-  const canAnnotate = computed(() => role.value === 'editor' || role.value === 'commenter')
+  const canEdit = computed(() => roleCanEdit(role.value))
+  const canAnnotate = computed(() => roleCanAnnotate(role.value))
+  const canManage = computed(() => roleCanManage(role.value))
   const online = computed(() => status.value === 'online')
 
   function setUsers(list: UserInfo[]) {
@@ -53,6 +55,7 @@ export const useSessionStore = defineStore('session', () => {
     simulatedOffline,
     canEdit,
     canAnnotate,
+    canManage,
     online,
     setUsers,
     $reset,

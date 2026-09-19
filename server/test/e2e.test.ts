@@ -23,6 +23,7 @@ class TestClient {
   clientId = ''
   doc = ''
   revision = 0
+  epoch = 0
   pending: { opId: string; op: Op } | null = null
   inbox: ServerMsg[] = []
   private waiters: { pred: (m: ServerMsg) => boolean; resolve: (m: ServerMsg) => void }[] = []
@@ -53,6 +54,7 @@ class TestClient {
       case 'welcome': {
         const w = msg as WelcomeMsg
         this.clientId = w.clientId
+        this.epoch = w.epoch
         if (w.snapshot) {
           this.doc = w.doc
           this.revision = w.revision
@@ -95,6 +97,14 @@ class TestClient {
         this.revision = msg.revision + 1
         break
       }
+      case 'history:reset': {
+        // 版本恢复：全量替换，丢弃未确认操作
+        this.doc = msg.doc
+        this.revision = msg.revision
+        this.epoch = msg.epoch
+        this.pending = null
+        break
+      }
     }
   }
 
@@ -108,7 +118,14 @@ class TestClient {
 
   async join(lastRevision?: number) {
     await this.open()
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: this.role, lastRevision })
+    this.send({
+      type: 'join',
+      docId: this.docId,
+      name: this.name,
+      role: this.role,
+      lastRevision,
+      epoch: typeof lastRevision === 'number' ? this.epoch : undefined,
+    })
     await this.waitFor((m) => m.type === 'welcome')
   }
 
@@ -121,7 +138,7 @@ class TestClient {
     const opId = `${this.name}-${this.opCounter++}`
     this.doc = apply(this.doc, op)
     this.pending = { opId, op }
-    this.send({ type: 'op', revision: this.revision, op, opId })
+    this.send({ type: 'op', revision: this.revision, epoch: this.epoch, op, opId })
     return opId
   }
 
@@ -201,12 +218,12 @@ test('e2e: 权限控制 —— 只读不可编辑/批注，批注者可批注不
   await editor.waitFor((m) => m.type === 'ack')
 
   // viewer 编辑 → 拒绝
-  viewer.send({ type: 'op', revision: 1, op: [{ retain: 6 }, { insert: 'x' }], opId: 'v1' })
+  viewer.send({ type: 'op', revision: 1, epoch: 0, op: [{ retain: 6 }, { insert: 'x' }], opId: 'v1' })
   const errV = await viewer.waitFor((m) => m.type === 'error')
   assert.equal((errV as { code: string }).code, 'PERMISSION_DENIED')
 
   // commenter 编辑 → 拒绝
-  commenter.send({ type: 'op', revision: 1, op: [{ retain: 6 }, { insert: 'x' }], opId: 'm1' })
+  commenter.send({ type: 'op', revision: 1, epoch: 0, op: [{ retain: 6 }, { insert: 'x' }], opId: 'm1' })
   const errM = await commenter.waitFor((m) => m.type === 'error')
   assert.equal((errM as { code: string }).code, 'PERMISSION_DENIED')
 
@@ -296,10 +313,10 @@ test('e2e: 重复 opId 幂等（ack 丢失重发不重复应用）', async () =>
   const docId = 'e2e-idempotent'
   const a = new TestClient('A', 'editor', docId)
   await a.join()
-  a.send({ type: 'op', revision: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
+  a.send({ type: 'op', revision: 0, epoch: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
   await a.waitFor((m) => m.type === 'ack')
   // 模拟 ack 丢失后客户端重发同一操作
-  a.send({ type: 'op', revision: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
+  a.send({ type: 'op', revision: 0, epoch: 0, op: [{ insert: 'x' }], opId: 'dup-1' })
   await new Promise((r) => setTimeout(r, 300))
   const b = new TestClient('B', 'viewer', docId)
   await b.join()

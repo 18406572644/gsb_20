@@ -1,14 +1,18 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { ElMessageBox } from 'element-plus'
+import { Clock } from '@element-plus/icons-vue'
 import { useSessionStore } from '@/stores/session'
 import { useDocStore } from '@/stores/doc'
 import { collab } from '@/collab/collab'
 import { ROLE_LABEL } from '../../../shared/protocol'
 import UserAvatar from '@/components/UserAvatar.vue'
+import HistoryPanel from '@/components/HistoryPanel.vue'
 
 const session = useSessionStore()
 const doc = useDocStore()
+
+const historyOpen = ref(false)
 
 const connTag = computed(() => {
   switch (session.status) {
@@ -35,6 +39,7 @@ const syncTag = computed(() => {
 })
 
 const roleTagType = computed(() => {
+  if (session.role === 'owner') return 'danger'
   if (session.role === 'editor') return 'primary'
   if (session.role === 'commenter') return 'warning'
   return 'info'
@@ -64,7 +69,9 @@ async function quit() {
     <el-tag size="small" :type="connTag.type" effect="light">{{ connTag.text }}</el-tag>
     <el-tag size="small" :type="syncTag.type" effect="plain">{{ syncTag.text }}</el-tag>
     <el-tag size="small" :type="roleTagType" effect="dark">{{ ROLE_LABEL[session.role] }}</el-tag>
-    <span style="font-size: 12px; color: #909399">v{{ doc.revision }}</span>
+    <span style="font-size: 12px; color: #909399">
+      v{{ doc.revision }}<template v-if="doc.epoch > 0"> · e{{ doc.epoch }}</template>
+    </span>
 
     <div class="spacer" />
 
@@ -80,6 +87,17 @@ async function quit() {
     </div>
 
     <el-button
+      v-if="session.canManage"
+      size="small"
+      type="danger"
+      plain
+      :icon="Clock"
+      :disabled="!session.online"
+      @click="historyOpen = true"
+    >
+      历史
+    </el-button>
+    <el-button
       size="small"
       :type="session.status === 'offline' ? 'success' : 'warning'"
       plain
@@ -88,5 +106,7 @@ async function quit() {
       {{ session.status === 'offline' ? '重新连接' : '模拟断线' }}
     </el-button>
     <el-button size="small" plain @click="quit">退出</el-button>
+
+    <HistoryPanel v-model="historyOpen" />
   </div>
 </template>

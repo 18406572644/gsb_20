@@ -4,12 +4,16 @@ import type { Annotation } from '../../../shared/protocol'
 
 export type SyncState = 'synced' | 'pending' | 'resyncing'
 
-/** 文档状态：正文、版本、批注、当前选区 */
+/** 文档状态：正文、版本、纪元、批注、当前选区 */
 export const useDocStore = defineStore('doc', () => {
   const text = ref('')
   const revision = ref(0)
+  /** 版本纪元：每次版本恢复 +1 */
+  const epoch = ref(0)
   const annotations = ref<Annotation[]>([])
   const syncState = ref<SyncState>('synced')
+  /** 版本恢复进行中的短暂冻结：阻止本地提交与批注操作 */
+  const frozen = ref(false)
   /** 当前编辑器选区（用于创建批注） */
   const selection = ref<{ start: number; end: number } | null>(null)
   /** 面板点击「定位」时编辑器滚动到该批注（计数器触发 watch） */
@@ -44,8 +48,10 @@ export const useDocStore = defineStore('doc', () => {
   function $reset() {
     text.value = ''
     revision.value = 0
+    epoch.value = 0
     annotations.value = []
     syncState.value = 'synced'
+    frozen.value = false
     selection.value = null
     locateTarget.value = null
     activeAnnId.value = null
@@ -54,8 +60,10 @@ export const useDocStore = defineStore('doc', () => {
   return {
     text,
     revision,
+    epoch,
     annotations,
     syncState,
+    frozen,
     selection,
     locateTarget,
     activeAnnId,

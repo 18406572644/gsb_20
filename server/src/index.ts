@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { DocSession, type ClientState } from './docSession'
-import type { ClientMsg, ServerMsg } from '../../shared/protocol'
+import type { ClientMsg, LogEntry, ServerMsg } from '../../shared/protocol'
+import { canManage } from '../../shared/protocol'
 
 const PORT = Number(process.env.PORT || 8080)
 const ROOT = join(fileURLToPath(new URL('.', import.meta.url)), '..')
@@ -19,7 +20,8 @@ const DEFAULT_DOC = `# 多人协同批注编辑器（演示文档）
 1. 以「编辑」身份直接修改正文，所有修改通过 OT 算法实时合并；
 2. 以「批注」身份选中文字后添加批注，批注锚点会随编辑自动移动；
 3. 以「只读」身份旁观整个协作过程；
-4. 点击工具栏「模拟断线」体验断网重连与状态回滚。
+4. 点击工具栏「模拟断线」体验断网重连与状态回滚；
+5. 以「管理者」身份打开版本历史，查看变更摘要并恢复到任意历史版本。
 
 试着再开几个浏览器标签页，用不同身份加入同一文档吧。
 `
@@ -35,17 +37,33 @@ function dataFile(docId: string) {
   return join(DATA_DIR, `${encodeURIComponent(docId)}.json`)
 }
 
-function schedulePersist(session: DocSession) {
-  if (persistTimers.has(session.docId)) return
+function persistNow(session: DocSession) {
+  try {
+    writeFileSync(dataFile(session.docId), JSON.stringify(session.serialize(), null, 2))
+  } catch (e) {
+    console.error('[persist] 写入失败:', e)
+  }
+}
+
+/**
+ * 调度持久化：默认 1500ms 防抖合并；immediate=true（手动保存 / 恢复）时
+ * 取消待写定时器并立即同步落盘。
+ */
+function schedulePersist(session: DocSession, immediate = false) {
+  const pending = persistTimers.get(session.docId)
+  if (pending) {
+    clearTimeout(pending)
+    persistTimers.delete(session.docId)
+  }
+  if (immediate) {
+    persistNow(session)
+    return
+  }
   persistTimers.set(
     session.docId,
     setTimeout(() => {
       persistTimers.delete(session.docId)
-      try {
-        writeFileSync(dataFile(session.docId), JSON.stringify(session.serialize(), null, 2))
-      } catch (e) {
-        console.error('[persist] 写入失败:', e)
-      }
+      persistNow(session)
     }, 1500),
   )
 }
@@ -57,7 +75,7 @@ function getSession(docId: string): DocSession {
   if (existsSync(file)) {
     try {
       s = DocSession.deserialize(JSON.parse(readFileSync(file, 'utf8')))
-      console.log(`[doc] 从磁盘恢复文档 ${docId} (rev=${s.revision})`)
+      console.log(`[doc] 从磁盘恢复文档 ${docId} (rev=${s.revision}, epoch=${s.epoch}, 版本=${s.versions.length})`)
     } catch (e) {
       console.error('[doc] 恢复失败，使用空文档:', e)
       s = new DocSession(docId, '')
@@ -65,7 +83,7 @@ function getSession(docId: string): DocSession {
   } else {
     s = new DocSession(docId, docId === 'demo' ? DEFAULT_DOC : '')
   }
-  s.onDirty = () => schedulePersist(s!)
+  s.onDirty = (immediate?: boolean) => schedulePersist(s!, immediate)
   sessions.set(docId, s)
   return s
 }
@@ -129,6 +147,60 @@ wss.on('connection', (ws: WebSocket) => {
     }
   }
 
+  /** 按 buildResync 结果下发：增量（join 时 welcome + ops；主动 resync 仅 ops）或全量快照 welcome */
+  const sendResync = (
+    resync: ReturnType<DocSession['buildResync']>,
+    includeWelcome: boolean,
+  ) => {
+    if (!session || !client) return
+    if (resync.kind === 'ops') {
+      if (includeWelcome) {
+        // 增量补齐：welcome 不带文档（客户端保留本地文档），随后补发错过的操作流
+        send({
+          type: 'welcome',
+          clientId: connId,
+          docId: session.docId,
+          revision: session.revision,
+          epoch: session.epoch,
+          doc: '',
+          annotations: [...session.annotations.values()],
+          users: session.users(),
+          role: client.role,
+          snapshot: false,
+          seq: session.seq,
+        } satisfies ServerMsg)
+      }
+      session.seq++
+      send({
+        type: 'ops',
+        ops: resync.ops.map((e: LogEntry) => ({
+          revision: e.revision,
+          op: e.op,
+          opId: e.opId,
+          clientId: e.clientId,
+          authorName: e.authorName,
+          timestamp: e.timestamp,
+        })),
+        revision: session.revision,
+        seq: session.seq,
+      } satisfies ServerMsg)
+    } else {
+      send({
+        type: 'welcome',
+        clientId: connId,
+        docId: session.docId,
+        revision: session.revision,
+        epoch: session.epoch,
+        doc: session.doc,
+        annotations: [...session.annotations.values()],
+        users: session.users(),
+        role: client.role,
+        snapshot: true,
+        seq: session.seq,
+      } satisfies ServerMsg)
+    }
+  }
+
   ws.on('pong', () => alive.set(connId, ws))
 
   ws.on('message', (raw) => {
@@ -151,48 +223,7 @@ wss.on('connection', (ws: WebSocket) => {
           session = getSession(msg.docId || 'demo')
           client = session.addClient(connId, msg.name, msg.role, send)
           const lastRevision = typeof msg.lastRevision === 'number' ? msg.lastRevision : -1
-          const resync = session.buildResync(lastRevision)
-          if (resync.kind === 'ops') {
-            // 增量补齐：welcome 不带文档（客户端保留本地文档），随后补发错过的操作流
-            send({
-              type: 'welcome',
-              clientId: connId,
-              docId: session.docId,
-              revision: session.revision,
-              doc: '',
-              annotations: [...session.annotations.values()],
-              users: session.users(),
-              role: client.role,
-              snapshot: false,
-              seq: session.seq,
-            } satisfies ServerMsg)
-            session.seq++
-            send({
-              type: 'ops',
-              ops: resync.ops.map((e) => ({
-                revision: e.revision,
-                op: e.op,
-                opId: e.opId,
-                clientId: e.clientId,
-                authorName: e.authorName,
-              })),
-              revision: session.revision,
-              seq: session.seq,
-            } satisfies ServerMsg)
-          } else {
-            send({
-              type: 'welcome',
-              clientId: connId,
-              docId: session.docId,
-              revision: session.revision,
-              doc: session.doc,
-              annotations: [...session.annotations.values()],
-              users: session.users(),
-              role: client.role,
-              snapshot: true,
-              seq: session.seq,
-            } satisfies ServerMsg)
-          }
+          sendResync(session.buildResync(lastRevision, msg.epoch), true)
           session.broadcastAll({ type: 'presence', users: session.users() })
           console.log(`[join] ${client.name} (${client.role}) → ${session.docId}，在线 ${session.clients.size} 人`)
           break
@@ -200,7 +231,7 @@ wss.on('connection', (ws: WebSocket) => {
 
         case 'op': {
           if (!session || !client) return
-          const err = session.receiveOp(client, msg.revision, msg.op, msg.opId)
+          const err = session.receiveOp(client, msg.revision, msg.epoch, msg.op, msg.opId)
           if (err) send({ type: 'error', code: err.code, message: err.message, opId: msg.opId })
           break
         }
@@ -241,35 +272,55 @@ wss.on('connection', (ws: WebSocket) => {
 
         case 'resync': {
           if (!session || !client) return
-          const resync = session.buildResync(msg.lastRevision)
-          if (resync.kind === 'ops') {
-            session.seq++
-            send({
-              type: 'ops',
-              ops: resync.ops.map((e) => ({
-                revision: e.revision,
-                op: e.op,
-                opId: e.opId,
-                clientId: e.clientId,
-                authorName: e.authorName,
-              })),
-              revision: session.revision,
-              seq: session.seq,
-            } satisfies ServerMsg)
-          } else {
-            // 全量快照：客户端丢弃本地未确认修改并回滚
-            send({
-              type: 'welcome',
-              clientId: connId,
-              docId: session.docId,
-              revision: session.revision,
-              doc: session.doc,
-              annotations: [...session.annotations.values()],
-              users: session.users(),
-              role: client.role,
-              snapshot: true,
-              seq: session.seq,
-            } satisfies ServerMsg)
+          sendResync(session.buildResync(msg.lastRevision, msg.epoch), false)
+          break
+        }
+
+        /* ---------------- 版本历史（仅 owner） ---------------- */
+
+        case 'history:list': {
+          if (!session || !client) return
+          if (!canManage(client.role)) {
+            send({ type: 'error', code: 'PERMISSION_DENIED', message: '仅管理者可查看版本历史', reqId: msg.reqId })
+            return
+          }
+          send({ type: 'history:list', reqId: msg.reqId, ...session.listHistory() } satisfies ServerMsg)
+          break
+        }
+
+        case 'history:get': {
+          if (!session || !client) return
+          if (!canManage(client.role)) {
+            send({ type: 'error', code: 'PERMISSION_DENIED', message: '仅管理者可查看版本历史', reqId: msg.reqId })
+            return
+          }
+          const version = session.getVersion(msg.versionId)
+          if (!version) {
+            send({ type: 'error', code: 'NOT_FOUND', message: '版本不存在或已被裁剪', reqId: msg.reqId })
+            return
+          }
+          send({ type: 'history:version', reqId: msg.reqId, version } satisfies ServerMsg)
+          break
+        }
+
+        case 'history:save': {
+          if (!session || !client) return
+          const result = session.saveVersion(client, msg.label)
+          if ('code' in result) {
+            send({ type: 'error', code: result.code, message: result.message, reqId: msg.reqId })
+            return
+          }
+          // buildSnapshot 已向全员广播 history:added；此处对请求方补带 reqId 的应答
+          send({ type: 'history:added', version: result.version, reqId: msg.reqId } satisfies ServerMsg)
+          break
+        }
+
+        case 'history:restore': {
+          if (!session || !client) return
+          // reset 已在 restoreVersion 内广播给所有人（含请求方），此处仅负责错误应答
+          const result = session.restoreVersion(client, msg.versionId, msg.reqId)
+          if ('code' in result) {
+            send({ type: 'error', code: result.code, message: result.message, reqId: msg.reqId })
           }
           break
         }
@@ -321,9 +372,15 @@ server.listen(PORT, () => {
 
 export function shutdown() {
   clearInterval(heartbeat)
+  // 关闭前把防抖窗口内未落盘的变更同步写盘（恢复 / 手动保存本身已立即落盘）
+  for (const [docId, timer] of persistTimers) {
+    clearTimeout(timer)
+    const s = sessions.get(docId)
+    if (s) persistNow(s)
+  }
+  persistTimers.clear()
   for (const ws of alive.values()) ws.terminate()
   alive.clear()
-  for (const t of persistTimers.values()) clearTimeout(t)
   wss.close()
   server.close()
 }

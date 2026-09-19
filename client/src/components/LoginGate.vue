@@ -15,6 +15,7 @@ const form = reactive({
 const joining = ref(false)
 
 const ROLE_DESCS: Record<Role, string> = {
+  owner: '可编辑正文、添加批注，并管理版本历史（查看时间线 / 预览 / 恢复版本）',
   editor: '可编辑正文，也可添加与回复批注',
   commenter: '不可修改正文，可选中文字添加批注',
   viewer: '仅可查看文档、批注与他人光标',
@@ -32,7 +33,7 @@ function join() {
   <div class="login-wrap">
     <el-card class="login-card">
       <h2 class="login-title">多人协同批注编辑器</h2>
-      <p class="login-sub">基于 OT 的实时协同 · 支持只读 / 批注 / 编辑三种身份 · 断网自动重连</p>
+      <p class="login-sub">基于 OT 的实时协同 · 只读 / 批注 / 编辑 / 管理者四种身份 · 版本历史与恢复 · 断网自动重连</p>
       <el-form label-position="top">
         <el-form-item label="文档 ID">
           <el-input v-model="form.docId" placeholder="同一文档 ID 的用户实时协同" />
@@ -42,6 +43,7 @@ function join() {
         </el-form-item>
         <el-form-item label="身份">
           <el-radio-group v-model="form.role">
+            <el-radio-button value="owner">管理者</el-radio-button>
             <el-radio-button value="editor">编辑</el-radio-button>
             <el-radio-button value="commenter">批注</el-radio-button>
             <el-radio-button value="viewer">只读</el-radio-button>

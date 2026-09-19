@@ -33,19 +33,21 @@ class HeadlessClient {
   ws: WebSocket | null = null
   ot: OTClient
   resyncCount = 0
+  epoch = 0
 
   constructor(
     readonly name: string,
     readonly docId: string,
   ) {
     this.ot = new OTClient({
-      sendOp: (op, opId, revision) => this.send({ type: 'op', op, opId, revision }),
+      sendOp: (op, opId, revision) =>
+        this.send({ type: 'op', op, opId, revision, epoch: this.epoch }),
       applyRemote: (op) => {
         this.doc = apply(this.doc, op)
       },
       requestResync: () => {
         this.resyncCount++
-        this.send({ type: 'resync', lastRevision: this.ot.revision })
+        this.send({ type: 'resync', lastRevision: this.ot.revision, epoch: this.epoch })
       },
     })
     this.ot.minSendInterval = 0
@@ -64,7 +66,14 @@ class HeadlessClient {
       this.ws!.once('open', resolve)
       this.ws!.once('error', reject)
     })
-    this.send({ type: 'join', docId: this.docId, name: this.name, role: 'editor', lastRevision })
+    this.send({
+      type: 'join',
+      docId: this.docId,
+      name: this.name,
+      role: 'editor',
+      lastRevision,
+      epoch: typeof lastRevision === 'number' ? this.epoch : undefined,
+    })
     await waitFor(() => this.ready, 3000)
   }
 
@@ -73,6 +82,7 @@ class HeadlessClient {
   private handle(msg: ServerMsg) {
     switch (msg.type) {
       case 'welcome':
+        this.epoch = msg.epoch
         if (msg.snapshot) {
           this.ot.rollback(msg.revision)
           this.doc = msg.doc
@@ -91,6 +101,13 @@ class HeadlessClient {
         break
       case 'ack':
         this.ot.ack(msg.opId, msg.revision)
+        break
+      case 'history:reset':
+        // 版本恢复：全员全量重同步
+        this.ot.rollback(msg.revision)
+        this.doc = msg.doc
+        this.epoch = msg.epoch
+        this.ot.setConnected(true)
         break
     }
   }
